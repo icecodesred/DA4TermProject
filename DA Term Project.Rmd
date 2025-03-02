@@ -462,7 +462,7 @@ final_merged_filtered <- final_merged_filtered %>%
 
 unemployment_trends <- final_merged_filtered %>%
   group_by(year, hosted_event) %>%
-  summarise(Unemployment = mean(Unemployment, na.rm = TRUE), .groups = "drop") %>%  # Ensure it doesn't stay grouped
+  summarise(Unemployment = mean(Unemployment, na.rm = TRUE), .groups = "drop") %>%  
   pivot_wider(names_from = hosted_event, values_from = Unemployment, names_prefix = "Hosted_Event_")
 
 
