@@ -1,0 +1,481 @@
+---
+title: "DA4 Term Project"
+author: "me"
+date: "2025-03-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(mice) 
+library(MatchIt)
+library(cobalt)
+
+world_bank_data<-read_excel("P_World unemployment rates.xlsx")
+names(world_bank_data)[1] <- "country"
+country_list <- unique(world_bank_data$country)
+year_list <- seq(1989, 2023, 1)
+hosted_events <- expand.grid(country = country_list, year = year_list)
+```
+
+```{r}
+#creating data for sporting events
+sports_events <- data.frame(
+  country = c(
+    "South Korea", "Spain", "USA", "Australia", "Greece", "China", "United Kingdom", "Brazil", "Japan", "France", 
+    "Canada", "France", "Norway", "Japan", "United States", "Italy", "Canada", "Russian Federation", "South Korea", "China", 
+    "Italy", "USA", "France", "Korea, Rep.", "Japan", "Germany", "South Africa", "Brazil", "Russia", "Qatar", 
+    "Germany", "Sweden", "England", "Belgium", "Netherlands", "Portugal", "Austria", "Poland", "France", "United Kingdom", 
+    "Chile", "Ecuador", "Uruguay", "Bolivia", "Paraguay", "Colombia", "Peru", "Venezuela",
+    "Argentina", "Chile", "United States", "Brazil", "Brazil",
+    "New Zealand", "Canada", "Malaysia", "United Kingdom", "Australia", "India", "Scotland", "Australia", "United Kingdom", 
+    "China", "Japan", "Korea, Rep.", "Thailand", "Qatar", "China", "Korea, Rep.", "Indonesia", "China" 
+  ),
+  year = c(
+    1988, 1992, 1996, 2000, 2004, 2008, 2012, 2016, 2020, 2024, # Summer Olympics
+    1988, 1992, 1994, 1998, 2002, 2006, 2010, 2014, 2018, 2022, # Winter Olympics
+    1990, 1994, 1998, 2002, 2002, 2006, 2010, 2014, 2018, 2022, # FIFA World Cup
+    1988, 1992, 1996, 2000, 2004, 2008, 2012, 2016, 2020, 2024, # UEFA EURO
+    1991, 1993, 1995, 1997, 1999, 2001, 2004, 2007, 2011, 2015, 2016, 2019, 2021, # Copa América
+    1990, 1994, 1998, 2002, 2006, 2010, 2014, 2018, 2022, # Commonwealth Games
+    1990, 1994, 1998, 2002, 2006, 2010, 2014, 2018, 2022  # Asian Games
+  ),
+  event_type = c(
+    "Olympics", "Olympics", "Olympics", "Olympics", "Olympics", "Olympics", "Olympics", "Olympics", "Olympics", "Olympics",
+    "WinterOlympics", "WinterOlympics", "WinterOlympics", "WinterOlympics", "WinterOlympics", "WinterOlympics", "WinterOlympics", "WinterOlympics", "WinterOlympics", "WinterOlympics",
+    "FIFA", "FIFA", "FIFA", "FIFA", "FIFA", "FIFA", "FIFA", "FIFA", "FIFA", "FIFA",
+    "EUROCUP", "EUROCUP", "EUROCUP", "EUROCUP", "EUROCUP", "EUROCUP", "EUROCUP", "EUROCUP", "EUROCUP", "EUROCUP",
+    "CopaAmerica", "CopaAmerica", "CopaAmerica", "CopaAmerica", "CopaAmerica", "CopaAmerica", "CopaAmerica", "CopaAmerica", "CopaAmerica", "CopaAmerica", "CopaAmerica", "CopaAmerica", "CopaAmerica",
+    "Commonwealth", "Commonwealth", "Commonwealth", "Commonwealth", "Commonwealth", "Commonwealth", "Commonwealth", "Commonwealth", "Commonwealth",
+    "AsianGames", "AsianGames", "AsianGames", "AsianGames", "AsianGames", "AsianGames", "AsianGames", "AsianGames", "AsianGames"
+  )
+)
+
+sports_events_wide<-sports_events %>%
+  mutate(hosted=1) %>%
+  pivot_wider(names_from=event_type, values_from=hosted, values_fill=list(hosted=0))
+
+hosted_events<-left_join(hosted_events, sports_events_wide, by=c("country", "year"))
+hosted_events[is.na(hosted_events)]<-0
+
+write.csv(hosted_events, "event_hosting_data", row.names=FALSE)
+head(hosted_events)
+```
+
+```{r}
+#propensity score matching data prep
+psm_data<-read_excel("P_Data_Extract_From_World_Development_Indicators.xlsx")
+psm_data<-data.table(psm_data)
+
+psm_data_long<-melt(psm_data, measure.vars=patterns("^\\d{4}"),variable.name="year_messy", value.name = "value",na.rm=TRUE)
+
+psm_data_long[, year := as.integer(sub("^(\\d{4}).*", "\\1", year_messy))]
+setnames(psm_data_long, old=c("Country Name", "Country Code", "Series Name", "Series Code"),new = c("country", "Country.Code", "Series.Name", "Series.Code"))
+
+psm_prepped<-dcast(psm_data_long, Country.Code + country + year ~ Series.Code, value.var = "value")
+
+names(psm_prepped)[4]<-"HCI"
+names(psm_prepped)[5]<-"Gov.Exp"
+names(psm_prepped)[6]<-"GDP_growth"
+names(psm_prepped)[7]<-"GDP_per_capita"
+names(psm_prepped)[8]<-"Unemployment"
+names(psm_prepped)[9]<-"Urbanization"
+
+#NA handling 
+psm_prepped<-psm_prepped %>%
+  mutate(
+    GDP_growth=ifelse(GDP_growth=="..", NA, as.numeric(GDP_growth)),
+    Unemployment=ifelse(Unemployment== "..", NA, as.numeric(Unemployment)),
+    HCI=ifelse(HCI=="..", NA, as.numeric(HCI)),
+    Gov.Exp=ifelse(Gov.Exp=="..", NA, as.numeric(Gov.Exp)),
+    GDP_per_capita=ifelse(GDP_per_capita=="..", NA, as.numeric(GDP_per_capita)),
+    Urbanization=ifelse(Urbanization=="..", NA, as.numeric(Urbanization))
+  )
+
+missing_counts_psm <- psm_prepped%>%
+  group_by(Country.Code, country)%>%
+  summarize(
+    missing_gdp = sum(is.na(GDP_growth)),
+    missing_unemployment = sum(is.na(Unemployment)),
+    missing_gdp_per_capita = sum(is.na(GDP_per_capita)),
+    missing_gov_exp = sum(is.na(Gov.Exp)),
+    missing_hci = sum(is.na(HCI)),
+    missing_urbanization =sum(is.na(Urbanization)),
+    total_years = n()
+  )
+
+removes_psm<-missing_counts_psm%>%
+  filter(missing_gdp>=15 | missing_unemployment>=20 | 
+         missing_gdp_per_capita >=20 | missing_gov_exp >= 15 |
+         missing_urbanization>=15) %>%
+  pull(country)
+
+#NA removal with too many missing observations
+psm_cleaned<-psm_prepped%>%
+  filter(!country%in%removes_psm)
+
+#HCI was not important after all
+psm_cleaned<-psm_cleaned%>%select(-HCI)
+
+psm_cleaned <-psm_cleaned %>%
+  filter(year >= 1990)
+```
+
+```{r}
+country_list <- unique(psm_cleaned$country)
+
+#Removing non-countries
+rm<-c(
+  "World", "High income", "Upper middle income", "Lower middle income", 
+  "Low & middle income", "OECD members", "Euro area", "European Union",
+  "Latin America & Caribbean", "Latin America & Caribbean (excluding high income)",
+  "East Asia & Pacific", "East Asia & Pacific (excluding high income)", 
+  "Europe & Central Asia", "Europe & Central Asia (excluding high income)",
+  "Middle East & North Africa", "Middle East & North Africa (excluding high income)",
+  "South Asia", "South Asia (IDA & IBRD)", 
+  "Sub-Saharan Africa", "Sub-Saharan Africa (excluding high income)", 
+  "IBRD only", "Post-demographic dividend", "Late-demographic dividend", "Central Europe and the Baltics", "East Asia & Pacific (IDA & IBRD countries)", "Europe & Central Asia (IDA & IBRD countries)", "Latin America & the Caribbean (IDA & IBRD countries)", "North America"
+)
+
+region_mapping_1 <- data.frame(
+  country = c(
+    "Albania", "Argentina", "Armenia", "Australia", "Austria", 
+    "Azerbaijan", "Belgium", "Bulgaria", "Bahamas, The", "Bosnia and Herzegovina", 
+    "Belarus", "Belize", "Bolivia", "Brazil", "Bhutan", 
+    "Canada", "Switzerland", "Chile", "China", "Colombia"
+  ),
+  region = c(
+    "Europe", "South America", "Europe", "Oceania", "Europe",
+    "Europe", "Europe", "Europe", "Caribbean", "Europe",
+    "Europe", "Central America", "South America", "South America", "Asia",
+    "North America", "Europe", "South America", "Asia", "South America"
+  )
+)
+
+region_mapping_2 <- data.frame(
+  country = c(
+    "Costa Rica", "Cyprus", "Czechia", "Germany", "Denmark",
+    "Dominican Republic", "Algeria", "Ecuador", "Egypt, Arab Rep.", "Spain",
+    "Estonia", "Finland", "France", "United Kingdom", "Georgia",
+    "Greece", "Guatemala", "Hong Kong SAR, China", "Honduras", "Croatia"
+  ),
+  region = c(
+    "Central America", "Europe", "Europe", "Europe", "Europe",
+    "Caribbean", "Africa", "South America", "Africa", "Europe",
+    "Europe", "Europe", "Europe", "Europe", "Europe",
+    "Europe", "Central America", "Asia", "Central America", "Europe"
+  )
+)
+
+region_mapping_3 <- data.frame(
+  country = c(
+    "Hungary", "Indonesia", "Ireland", "Iran, Islamic Rep.", "Iceland",
+    "Israel", "Italy", "Jamaica", "Jordan", "Japan",
+    "Kazakhstan", "Kyrgyz Republic", "Cambodia", "Korea, Rep.", "Kuwait",
+    "Sri Lanka", "Lithuania", "Luxembourg", "Latvia", "Macao SAR, China"
+  ),
+  region = c(
+    "Europe", "Asia", "Europe", "Middle East", "Europe",
+    "Middle East", "Europe", "Caribbean", "Middle East", "Asia",
+    "Asia", "Asia", "Asia", "Asia", "Middle East",
+    "Asia", "Europe", "Europe", "Europe", "Asia"
+  )
+)
+
+region_mapping_4 <- data.frame(
+  country = c(
+    "Morocco", "Moldova", "Mexico", "North Macedonia", "Malta",
+    "Mongolia", "Mauritius", "Malaysia", "Netherlands", "Norway",
+    "New Zealand", "Pakistan", "Panama", "Peru", "Philippines",
+    "Poland", "Portugal", "Paraguay", "Qatar", "Romania"
+  ),
+  region = c(
+    "Africa", "Europe", "North America", "Europe", "Europe",
+    "Asia", "Africa", "Asia", "Europe", "Europe",
+    "Oceania", "Asia", "Central America", "South America", "Asia",
+    "Europe", "Europe", "South America", "Middle East", "Europe"
+  )
+)
+
+region_mapping_5 <- data.frame(
+  country = c(
+    "Russian Federation", "Saudi Arabia", "Singapore", "El Salvador", "Serbia",
+    "Slovak Republic", "Slovenia", "Sweden", "Thailand", "Tunisia",
+    "Turkiye", "Ukraine", "Uruguay", "United States", "Uzbekistan",
+    "Venezuela, RB", "Viet Nam", "South Africa"
+  ),
+  region = c(
+    "Europe", "Middle East", "Asia", "Central America", "Europe",
+    "Europe", "Europe", "Europe", "Asia", "Africa",
+    "Europe", "Europe", "South America", "North America", "Asia",
+    "South America", "Asia", "Africa"
+  )
+)
+
+region_mapping <- rbind(region_mapping_1, region_mapping_2, region_mapping_3, region_mapping_4, region_mapping_5)
+
+psm_cleaned<-psm_cleaned%>%
+  filter(!country %in%rm)%>%
+  left_join(region_mapping, by="country")
+
+#filling in NA gaps for missing values using linear interpolation
+filled_data<- mice(psm_cleaned, m = 5, method = "pmm", maxit = 10)  
+complete_data <- complete(filled_data, 1)  
+
+write.csv(psm_cleaned, "psm_cleaned_with_regions.csv", row.names = FALSE)
+table(psm_cleaned$region)
+```
+
+```{r}
+final_merged <- complete_data %>%
+  left_join(hosted_events, by = c("country", "year"))
+
+#creating hosting data
+final_merged <- final_merged %>%
+  mutate(hosted_event = ifelse(Olympics == 1 | WinterOlympics == 1 | FIFA == 1 | 
+                               EUROCUP == 1 | CopaAmerica == 1, 1, 0))
+
+#creating timestamps
+final_merged <- final_merged %>%
+  group_by(country) %>%
+  mutate(event_year = ifelse(any(hosted_event == 1), min(year[hosted_event == 1], na.rm = FALSE), NA)) %>%
+  ungroup() %>%  
+  mutate(time_since_event = year - event_year, 
+         Post_1 = ifelse(time_since_event == 1, 1, 0), 
+         Post_2 = ifelse(time_since_event == 2, 1, 0)) 
+
+final_merged$region <- as.factor(final_merged$region)
+
+#tweaking a few mistakes
+final_merged<- final_merged%>%
+  mutate(region = case_when(
+    country == "Puerto Rico" ~ "Caribbean",
+    country == "West Bank and Gaza" ~ "Middle East",
+    TRUE ~ region 
+  )) 
+
+final_merged %>% filter(is.na(region))
+```
+
+
+```{r}
+#preparing for matching, matching will occur on year before event 
+analysis_data2 <- final_merged %>%
+  filter(is.na(time_since_event) | time_since_event == -1)
+
+analysis_data2 <- analysis_data2 %>%
+  mutate(hosted_event = case_when(
+    time_since_event == -1 ~ 1,  
+    is.na(time_since_event) ~ 0, 
+    TRUE ~ hosted_event          
+  ))
+
+#nearest neighbor matching based on confounders
+psm_model <- matchit(
+  hosted_event ~ GDP_growth + GDP_per_capita + Urbanization + region,
+  data = analysis_data2,
+  method = "nearest", 
+  distance = "glm",
+  ratio = 1,
+  exact = ~ year  # Forces matches to be from the same year
+)
+
+matched_data2<-match.data(psm_model)
+
+write.csv(matched_data2, "matched_psm_data.csv", row.names = FALSE)
+```
+
+
+```{r}
+#covariate check
+bal_tab <- bal.tab(matched_data2, 
+                   weights = matched_data2$weights, 
+                   treat = matched_data2$hosted_event)
+bal_stats<-bal.tab(psm_model)
+#balance stats are OK. 
+print(bal_stats) 
+
+#Unemployment falls out of the range
+love.plot(psm_model, threshold = 0.1, abs = TRUE, 
+          var.order = "unadjusted", stars = "std")
+```
+```{r}
+#checking pairs
+matched_pairs <- matched_data2%>% select(country, year, subclass)
+
+#expanding subclass to other relevant observations
+analysis_data <- final_merged %>%
+  left_join(matched_pairs, by = c("country", "year")) %>% 
+  filter(between(time_since_event, -2, 2) | is.na(time_since_event))
+
+analysis_data <- analysis_data %>%
+  arrange(country, year) %>% 
+  group_by(country) %>%
+  mutate(subclass = case_when(
+    is.na(subclass) & lag(time_since_event) == -1 ~ lag(subclass),
+    is.na(subclass) & lag(time_since_event, 2) == -1 ~ lag(subclass, 2), 
+    is.na(subclass) & lag(time_since_event, 3) == -1 ~ lag(subclass, 3),
+    TRUE ~ subclass  
+  )) %>%
+  fill(subclass, .direction = "down") %>%  
+  ungroup()
+```
+
+
+```{r}
+#keeping only the relevant matched data
+matched_subset <- analysis_data %>%
+  filter(!is.na(subclass) & !is.na(time_since_event)) %>%
+  select(country, year, time_since_event, subclass, hosted_event, Unemployment, GDP_per_capita, Urbanization) 
+
+matching_rows <- analysis_data %>%
+  semi_join(matched_subset, by = c("subclass", "year")) 
+
+matching_rows <- matching_rows %>%
+  mutate(hosted_event = ifelse(!is.na(time_since_event), 1, 0))
+
+matching_rows <- matching_rows %>%
+  mutate(time_since_event = ifelse(is.na(time_since_event), 0, time_since_event))
+
+write.csv(matching_rows, "filtered_PSM.csv", row.names = FALSE)
+```
+
+
+```{r}
+#DID event study with tw-way fixed effects
+est_twfe <- feols(
+  Unemployment ~ i(time_since_event, hosted_event, ref = -1) + GDP_growth | 
+    country + year,
+  data = matching_rows,
+  cluster = ~country
+)
+
+summary(est_twfe)
+
+iplot(est_twfe, 
+      xlab = 'Time to treatment',
+      main = 'Event study: Staggered treatment (TWFE)')
+```
+
+```{r}
+#implementing heterogenity solution
+matching_rows <- matching_rows %>%
+  mutate(event_year = ifelse(is.na(event_year), 10000, event_year))
+
+est_twfe_adj <- feols(
+  Unemployment ~ sunab(event_year, year) + GDP_growth | 
+    country + year,
+  data = matching_rows,
+  cluster = ~country
+)
+
+summary(est_twfe_adj)
+
+iplot(list(est_twfe, est_twfe_adj), sep = 0.5, ref.line = -1,
+      xlab = 'Time since treatment',
+      main = 'Event study: Staggered treatment')
+legend("bottomleft", col = c(1, 2), pch = c(20, 17), 
+       legend = c("TWFE", "Sun & Abraham (2020)"))
+```
+```{r}
+#expanding the post-treatment observation period
+analysis_data3 <- final_merged %>%
+  left_join(matched_pairs, by = c("country", "year")) %>% 
+  filter(between(time_since_event, -2, 7) | is.na(time_since_event))
+
+analysis_data3<- analysis_data3%>%
+  arrange(country, year) %>% 
+  group_by(country) %>%
+  mutate(subclass = case_when(
+    is.na(subclass) & lag(time_since_event) == -1 ~ lag(subclass),
+    is.na(subclass) & lag(time_since_event, 2) == -1 ~ lag(subclass, 2), 
+    is.na(subclass) & lag(time_since_event, 3) == -1 ~ lag(subclass, 3),
+    TRUE ~ subclass  
+  )) %>%
+  fill(subclass, .direction = "down") %>%  
+  ungroup()
+
+matched_subset3<- analysis_data3%>%
+  filter(!is.na(subclass) & !is.na(time_since_event)) %>%
+  select(country, year, time_since_event, subclass, hosted_event, Unemployment, GDP_per_capita, Urbanization) 
+
+matching_rows3<- analysis_data3%>%
+  semi_join(matched_subset3, by = c("subclass", "year")) 
+
+matching_rows3<- matching_rows3%>%
+  mutate(hosted_event = ifelse(!is.na(time_since_event), 1, 0))
+
+matching_rows3<- matching_rows3%>%
+  mutate(time_since_event = ifelse(is.na(time_since_event), 0, time_since_event))
+
+write.csv(matching_rows3, "filtered_PSM3.csv", row.names = FALSE)
+
+```
+
+```{r}
+#once more DiD with fixed effects
+est_twfe3<- feols(
+  Unemployment ~ i(time_since_event, hosted_event, ref = -1) + GDP_growth | 
+    country + year,
+  data = matching_rows3,
+  cluster = ~country
+)
+
+summary(est_twfe3)
+
+iplot(est_twfe3, 
+      xlab = 'Time to treatment',
+      main = 'Event study: Staggered treatment (TWFE)')
+```
+```{r}
+#heterogenity control again
+matching_rows3<- matching_rows3%>%
+  mutate(event_year = ifelse(is.na(event_year), 10000, event_year))
+
+est_twfe_adj3<- feols(
+  Unemployment ~ sunab(event_year, year) + GDP_growth | 
+    country + year,
+  data = matching_rows3,
+  cluster = ~country
+)
+
+summary(est_twfe_adj3)
+
+iplot(list(est_twfe3, est_twfe_adj3), sep = 0.5, ref.line = -1,
+      xlab = 'Time since treatment',
+      main = 'Event study: Staggered treatment')
+```
+
+```{r}
+#paralell trends assumptions 
+final_merged_filtered <- final_merged %>%
+  semi_join(matching_rows3, by = "country")
+
+final_merged_filtered <- final_merged_filtered %>%
+  mutate(hosted_event = ifelse(!is.na(event_year), 1, hosted_event))
+
+unemployment_trends <- final_merged_filtered %>%
+  group_by(year, hosted_event) %>%
+  summarise(Unemployment = mean(Unemployment, na.rm = TRUE), .groups = "drop") %>%  # Ensure it doesn't stay grouped
+  pivot_wider(names_from = hosted_event, values_from = Unemployment, names_prefix = "Hosted_Event_")
+
+
+print(unemployment_trends)
+
+ggplot(final_merged_filtered, aes(x = year, y = Unemployment, color = as.factor(hosted_event))) +
+  geom_line(stat = "summary", fun = mean, size = 1) +  
+  geom_point(stat = "summary", fun = mean, size = 2) + 
+  labs(title = "Unemployment Trends: Treated vs. Control",
+       x = "Year",
+       y = "Average Unemployment Rate",
+       color = "Hosted Event") +
+  theme_minimal()
+```
+
+
